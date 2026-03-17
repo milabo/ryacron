@@ -14,7 +14,7 @@ This project is intentionally small for now.
 - Cargo Lambda execution backend
 - Payload from file or generated EventBridge-like event
 - Per-job timeout
-- Overlap policy: `allow` or `forbid`
+- Per-job max concurrent runs with skip-on-limit behavior
 
 The long-term direction is to keep the project name and config model generic while allowing more execution backends in the future.
 
@@ -54,7 +54,7 @@ jobs:
     payload:
       file: examples/eventbridge.json
     timeout_seconds: 600
-    overlap_policy: forbid
+    max_concurrent_runs: 1
 
   - name: batch_job_b
     schedule: "0 */5 * * * *"
@@ -62,7 +62,7 @@ jobs:
     payload:
       generate_eventbridge_scheduled_event: true
     timeout_seconds: 600
-    overlap_policy: forbid
+    max_concurrent_runs: 5
 ```
 
 ### Top-level fields
@@ -77,7 +77,7 @@ jobs:
 - `function`: Cargo Lambda function name passed to `cargo lambda invoke`
 - `payload`: optional payload source
 - `timeout_seconds`: optional timeout in seconds
-- `overlap_policy`: optional, `allow` or `forbid`
+- `max_concurrent_runs`: optional positive integer, defaults to `1`
 
 ### Payload modes
 
@@ -96,6 +96,26 @@ payload:
 ```
 
 If `payload` is omitted, `ryacron` invokes the function without `--data-file`.
+
+## Concurrency control
+
+`max_concurrent_runs` controls how many invocations of the same job may run at once.
+
+- If omitted, the default is `1`
+- If the job is already running `max_concurrent_runs` times, the next scheduled invoke is skipped
+- `1` matches the old "no overlap" behavior
+
+Example:
+
+```yaml
+jobs:
+  - name: batch_job
+    schedule: "0 * * * * *"
+    function: batch-job
+    max_concurrent_runs: 5
+```
+
+In this example, up to 5 concurrent `cargo lambda invoke` processes may run for `batch_job`. If 5 are already running, the next tick is skipped.
 
 ## Cron format
 
@@ -135,6 +155,7 @@ At startup, `ryacron` validates:
 - cron format
 - payload shape
 - payload file existence
+- `max_concurrent_runs >= 1`
 
 Invalid configuration causes startup to fail with a non-zero exit code.
 

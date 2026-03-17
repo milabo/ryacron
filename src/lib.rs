@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -32,21 +32,7 @@ pub struct JobConfig {
     pub function: String,
     pub payload: Option<PayloadConfig>,
     pub timeout_seconds: Option<u64>,
-    pub overlap_policy: Option<OverlapPolicy>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct PayloadConfig {
-    pub file: Option<PathBuf>,
-    pub generate_eventbridge_scheduled_event: Option<bool>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum OverlapPolicy {
-    Allow,
-    #[default]
-    Forbid,
+    pub max_concurrent_runs: Option<usize>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -62,7 +48,7 @@ pub struct JobDefinition {
     pub function: String,
     pub payload: JobPayload,
     pub timeout: Option<Duration>,
-    pub overlap_policy: OverlapPolicy,
+    pub max_concurrent_runs: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -70,6 +56,12 @@ pub enum JobPayload {
     None,
     File(PathBuf),
     GeneratedEventBridge,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct PayloadConfig {
+    pub file: Option<PathBuf>,
+    pub generate_eventbridge_scheduled_event: Option<bool>,
 }
 
 #[derive(Debug, Error)]
@@ -86,6 +78,8 @@ pub enum ConfigError {
     InvalidTimezone(String),
     #[error("job `{job}` has an invalid schedule `{schedule}`; MVP requires exactly 6 cron fields")]
     InvalidSchedule { job: String, schedule: String },
+    #[error("job `{job}` max_concurrent_runs must be at least 1")]
+    InvalidMaxConcurrentRuns { job: String },
     #[error(
         "job `{0}` payload must choose exactly one of `file` or `generate_eventbridge_scheduled_event: true`"
     )]
@@ -162,13 +156,13 @@ struct PreparedInvocation {
 
 #[derive(Debug)]
 struct JobRuntimeState {
-    running: AtomicBool,
+    running: AtomicUsize,
 }
 
 impl JobRuntimeState {
     fn new() -> Self {
         Self {
-            running: AtomicBool::new(false),
+            running: AtomicUsize::new(0),
         }
     }
 }
@@ -248,11 +242,12 @@ impl AppConfig {
 
 impl JobConfig {
     fn validate(self, base_dir: &Path) -> std::result::Result<JobDefinition, ConfigError> {
+        let job_name = self.name.clone();
         validate_schedule(&self.name, &self.schedule)?;
 
         let payload = match self.payload {
             None => JobPayload::None,
-            Some(payload) => payload.validate(&self.name, base_dir)?,
+            Some(payload) => payload.validate(&job_name, base_dir)?,
         };
 
         Ok(JobDefinition {
@@ -261,7 +256,13 @@ impl JobConfig {
             function: self.function,
             payload,
             timeout: self.timeout_seconds.map(Duration::from_secs),
-            overlap_policy: self.overlap_policy.unwrap_or_default(),
+            max_concurrent_runs: match self.max_concurrent_runs {
+                Some(0) => {
+                    return Err(ConfigError::InvalidMaxConcurrentRuns { job: job_name });
+                }
+                Some(value) => value,
+                None => 1,
+            },
         })
     }
 }
@@ -406,20 +407,14 @@ async fn run_scheduled_job(
     executor: Arc<dyn Executor>,
     state: Arc<JobRuntimeState>,
 ) {
-    if job.overlap_policy == OverlapPolicy::Forbid
-        && state
-            .running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-    {
-        println!("job={} status=skipped reason=overlap_forbidden", job.name);
+    let Some(guard) = RunningGuard::acquire(Arc::clone(&state), job.max_concurrent_runs) else {
+        println!(
+            "job={} status=skipped reason=max_concurrent_runs_reached limit={}",
+            job.name, job.max_concurrent_runs
+        );
         return;
-    }
+    };
 
-    let _guard = RunningGuard::new(
-        job.overlap_policy == OverlapPolicy::Forbid,
-        Arc::clone(&state),
-    );
     let scheduled_at = Utc::now();
     let ctx = ExecutionContext {
         scheduled_at,
@@ -443,24 +438,36 @@ async fn run_scheduled_job(
             eprintln!("job={} status=error error={err}", job.name);
         }
     }
+
+    drop(guard);
 }
 
 struct RunningGuard {
-    enabled: bool,
     state: Arc<JobRuntimeState>,
 }
 
 impl RunningGuard {
-    fn new(enabled: bool, state: Arc<JobRuntimeState>) -> Self {
-        Self { enabled, state }
+    fn acquire(state: Arc<JobRuntimeState>, limit: usize) -> Option<Self> {
+        loop {
+            let current = state.running.load(Ordering::Acquire);
+            if current >= limit {
+                return None;
+            }
+
+            if state
+                .running
+                .compare_exchange(current, current + 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                return Some(Self { state });
+            }
+        }
     }
 }
 
 impl Drop for RunningGuard {
     fn drop(&mut self) {
-        if self.enabled {
-            self.state.running.store(false, Ordering::Release);
-        }
+        self.state.running.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -565,7 +572,7 @@ mod tests {
                 function: "demo".to_string(),
                 payload: None,
                 timeout_seconds: None,
-                overlap_policy: None,
+                max_concurrent_runs: None,
             }],
         };
 
@@ -593,7 +600,7 @@ mod tests {
             function: "email-notification-sender".to_string(),
             payload: JobPayload::File(PathBuf::from("/tmp/payload.json")),
             timeout: Some(Duration::from_secs(600)),
-            overlap_policy: OverlapPolicy::Forbid,
+            max_concurrent_runs: 1,
         };
         let ctx = ExecutionContext {
             scheduled_at: DateTime::parse_from_rfc3339("2026-03-17T12:00:00+09:00")
@@ -626,7 +633,7 @@ mod tests {
             function: "batch-job".to_string(),
             payload: JobPayload::GeneratedEventBridge,
             timeout: Some(Duration::from_secs(600)),
-            overlap_policy: OverlapPolicy::Forbid,
+            max_concurrent_runs: 1,
         };
         let ctx = ExecutionContext {
             scheduled_at: DateTime::parse_from_rfc3339("2026-03-17T12:34:56+09:00")
@@ -647,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forbid_overlap_skips_second_run() {
+    async fn max_concurrent_runs_one_skips_second_run() {
         let started = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let executor = Arc::new(BlockedExecutor {
@@ -662,7 +669,7 @@ mod tests {
             function: "demo".to_string(),
             payload: JobPayload::None,
             timeout: None,
-            overlap_policy: OverlapPolicy::Forbid,
+            max_concurrent_runs: 1,
         });
         let state = Arc::new(JobRuntimeState::new());
 
@@ -690,7 +697,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn allow_overlap_runs_both() {
+    async fn max_concurrent_runs_allows_up_to_limit() {
         let calls = Arc::new(Mutex::new(0));
         let job = Arc::new(JobDefinition {
             name: "job".to_string(),
@@ -698,7 +705,7 @@ mod tests {
             function: "demo".to_string(),
             payload: JobPayload::None,
             timeout: None,
-            overlap_policy: OverlapPolicy::Allow,
+            max_concurrent_runs: 2,
         });
         let state = Arc::new(JobRuntimeState::new());
         let executor: Arc<dyn Executor> = Arc::new(CountingExecutor {
@@ -722,6 +729,24 @@ mod tests {
         second.await.unwrap();
 
         assert_eq!(*calls.lock().unwrap(), 2);
+    }
+
+    #[test]
+    fn rejects_zero_max_concurrent_runs() {
+        let raw = AppConfig {
+            timezone: "Asia/Tokyo".to_string(),
+            jobs: vec![JobConfig {
+                name: "bad".to_string(),
+                schedule: "0 * * * * *".to_string(),
+                function: "demo".to_string(),
+                payload: None,
+                timeout_seconds: None,
+                max_concurrent_runs: Some(0),
+            }],
+        };
+
+        let err = raw.validate(Path::new(".")).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidMaxConcurrentRuns { .. }));
     }
 
     struct CountingExecutor {
