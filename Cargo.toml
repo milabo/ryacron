@@ -1,7 +1,9 @@
 [package]
 name = "ryacron"
+description = "A YAML-driven local cron runner with a Cargo Lambda executor"
 version = "0.1.0"
 edition = "2024"
+license = "MIT"
 
 [dependencies]
 anyhow = "1.0.100"
